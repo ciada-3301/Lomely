@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
@@ -12,12 +12,82 @@ import {
   Plus,
   Menu,
   X,
+  Bell,
+  Check,
+  DoorOpen,
 } from "lucide-react";
+
+interface PendingInvite {
+  id: string;
+  roomId: string;
+  invitedBy: string;
+  createdAt: string;
+  room: {
+    id: string;
+    code: string;
+    name: string;
+    isPublic: boolean;
+    host: {
+      username: string;
+      avatarUrl?: string | null;
+    };
+  };
+}
 
 export default function Navbar() {
   const pathname = usePathname();
   const { user, logout } = useAuth();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [pendingInvites, setPendingInvites] = useState<PendingInvite[]>([]);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+
+  // Poll for pending room invites every 4 seconds when user is logged in
+  useEffect(() => {
+    if (!user) {
+      setPendingInvites([]);
+      return;
+    }
+
+    let isMounted = true;
+    const fetchInvites = async () => {
+      try {
+        const res = await fetch("/api/notifications");
+        if (res.ok) {
+          const data = await res.json();
+          if (isMounted && data.invites) {
+            setPendingInvites(data.invites);
+          }
+        }
+      } catch {}
+    };
+
+    fetchInvites();
+    const interval = setInterval(fetchInvites, 4000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [user]);
+
+  const handleInviteAction = async (inviteId: string, action: "ACCEPT" | "DECLINE") => {
+    try {
+      const res = await fetch("/api/notifications", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ inviteId, action }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPendingInvites((prev) => prev.filter((i) => i.id !== inviteId));
+        if (action === "ACCEPT" && data.roomCode) {
+          setNotificationsOpen(false);
+          window.location.href = `/room/${data.roomCode}`;
+        }
+      }
+    } catch (err) {
+      console.error("Invite action error:", err);
+    }
+  };
 
   // When inside a room, hide website navigation completely to provide Google Meet immersive theater container
   if (pathname.startsWith("/room/")) {
@@ -91,6 +161,74 @@ export default function Navbar() {
                 <Plus className="w-3.5 h-3.5" />
                 New Room
               </Link>
+
+              {/* Notification Bell with Badge & Dropdown */}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setNotificationsOpen(!notificationsOpen)}
+                  className={`p-1.5 rounded-lg text-zinc-400 hover:text-white transition-colors relative ${
+                    notificationsOpen ? "bg-clay-highlight text-white" : ""
+                  }`}
+                  title="Notifications"
+                >
+                  <Bell className="w-4 h-4" />
+                  {pendingInvites.length > 0 && (
+                    <span className="absolute -top-0.5 -right-0.5 w-4 h-4 bg-amber-500 text-black text-[9px] font-bold rounded-full flex items-center justify-center animate-pulse">
+                      {pendingInvites.length}
+                    </span>
+                  )}
+                </button>
+
+                {/* Notifications Dropdown */}
+                {notificationsOpen && (
+                  <div className="absolute right-0 mt-2 w-80 clay-card-elevated p-3 shadow-2xl border border-white/10 z-50 space-y-2">
+                    <div className="flex items-center justify-between pb-2 border-t border-b border-white/5">
+                      <span className="text-xs font-semibold text-white">Notifications</span>
+                      <span className="text-[10px] text-zinc-400 font-mono">
+                        {pendingInvites.length} pending
+                      </span>
+                    </div>
+
+                    {pendingInvites.length === 0 ? (
+                      <div className="py-6 text-center text-xs text-zinc-500">
+                        No pending invitations
+                      </div>
+                    ) : (
+                      <div className="space-y-2 max-h-64 overflow-y-auto">
+                        {pendingInvites.map((inv) => (
+                          <div
+                            key={inv.id}
+                            className="p-2.5 rounded-xl bg-white/5 border border-white/5 space-y-2"
+                          >
+                            <div className="text-xs text-zinc-300">
+                              <strong className="text-brand-400">@{inv.invitedBy}</strong> invited you to join{" "}
+                              <span className="text-white font-medium">{inv.room.name}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleInviteAction(inv.id, "ACCEPT")}
+                                className="flex-1 py-1 px-2.5 clay-btn-primary text-[11px] flex items-center justify-center gap-1"
+                              >
+                                <DoorOpen className="w-3 h-3" />
+                                Join Room
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleInviteAction(inv.id, "DECLINE")}
+                                className="py-1 px-2.5 rounded-lg bg-zinc-800 text-zinc-400 hover:text-white text-[11px]"
+                              >
+                                Dismiss
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
 
               <div className="clay-pill px-3 py-1 flex items-center gap-2">
                 <div className="w-5 h-5 rounded-full bg-clay-elevated flex items-center justify-center text-[10px] font-semibold text-zinc-200">

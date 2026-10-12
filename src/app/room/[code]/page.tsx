@@ -129,6 +129,7 @@ export default function RoomDetailPage() {
   // Refs for WebRTC connections
   const localStreamRef = useRef<MediaStream | null>(null);
   const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const pendingIceCandidates = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
 
   // In-Room Chat Stream
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -214,7 +215,7 @@ export default function RoomDetailPage() {
     }
   };
 
-  // 4. Initialize Socket and WebRTC once user enters the room
+  // 4. Initialize Socket, WebRTC, and Serverless Signaling Fallback
   useEffect(() => {
     if (!hasEnteredRoom || !roomCode || !userRef.current) return;
 
@@ -222,7 +223,7 @@ export default function RoomDetailPage() {
     socketRef.current = socket;
     const currentUser = userRef.current;
 
-    // Join room
+    // Join room via socket
     socket.emit("room:join", {
       roomCode: roomCode,
       user: {
@@ -232,7 +233,28 @@ export default function RoomDetailPage() {
       },
     });
 
-    // Smooth media acquisition: reuse active lobby track to avoid device lock, isolate audio/video
+    // Helper: Dispatch signaling messages via Socket.IO or HTTP fallback
+    const dispatchSignal = (targetId: string, signalData: any) => {
+      if (socketRef.current?.connected) {
+        socketRef.current.emit("webrtc:signal", {
+          targetSocketId: targetId,
+          signalData,
+        });
+      } else {
+        fetch(`/api/rooms/${roomCode}/signal`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            toUserId: targetId,
+            signalData,
+            fromUserId: currentUser.id,
+            fromUsername: currentUser.username,
+          }),
+        }).catch(() => {});
+      }
+    };
+
+    // Smooth media acquisition: reuse active lobby track, isolate audio/video
     const initMediaAndMesh = async () => {
       let audioTrack: MediaStreamTrack | null = null;
       let videoTrack: MediaStreamTrack | null = null;
@@ -291,36 +313,35 @@ export default function RoomDetailPage() {
 
     initMediaAndMesh();
 
-    // WebRTC Signaling Handlers with dynamic audio/video transceivers
-    const createPeer = (targetSocketId: string, initiator: boolean) => {
+    // Create RTCPeerConnection for a peer (by socketId or userId)
+    const createPeer = (targetPeerId: string, initiator: boolean) => {
+      if (peerConnections.current.has(targetPeerId)) {
+        return peerConnections.current.get(targetPeerId)!;
+      }
+
       const pc = new RTCPeerConnection(iceServers);
 
-      // Pre-add transceivers for bi-directional audio & video negotiation
-      pc.addTransceiver("audio", { direction: "sendrecv" });
-      pc.addTransceiver("video", { direction: "sendrecv" });
+      // Add existing local tracks or transceivers for bi-directional negotiation
+      const audioTrack = localStreamRef.current?.getAudioTracks()[0];
+      const videoTrack = localStreamRef.current?.getVideoTracks()[0];
 
-      if (localStreamRef.current) {
-        const audioTrack = localStreamRef.current.getAudioTracks()[0];
-        const videoTrack = localStreamRef.current.getVideoTracks()[0];
+      if (audioTrack) {
+        pc.addTrack(audioTrack, localStreamRef.current!);
+      } else {
+        pc.addTransceiver("audio", { direction: "sendrecv" });
+      }
 
-        if (audioTrack) {
-          const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
-          if (sender) sender.replaceTrack(audioTrack);
-          else pc.addTrack(audioTrack, localStreamRef.current);
-        }
-
-        if (videoTrack) {
-          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-          if (sender) sender.replaceTrack(videoTrack);
-          else pc.addTrack(videoTrack, localStreamRef.current);
-        }
+      if (videoTrack) {
+        pc.addTrack(videoTrack, localStreamRef.current!);
+      } else {
+        pc.addTransceiver("video", { direction: "sendrecv" });
       }
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          socket.emit("webrtc:signal", {
-            targetSocketId,
-            signalData: { type: "candidate", candidate: event.candidate },
+          dispatchSignal(targetPeerId, {
+            type: "candidate",
+            candidate: event.candidate,
           });
         }
       };
@@ -333,14 +354,15 @@ export default function RoomDetailPage() {
 
         setRemoteStreams((prev) => {
           const next = new Map(prev);
-          const existing = next.get(targetSocketId);
+          const existing = next.get(targetPeerId);
           if (existing) {
             if (!existing.getTracks().some((t) => t.id === event.track.id)) {
               existing.addTrack(event.track);
             }
-            return new Map(next);
+            next.set(targetPeerId, new MediaStream(existing.getTracks()));
+            return next;
           }
-          next.set(targetSocketId, incomingStream);
+          next.set(targetPeerId, incomingStream);
           return next;
         });
       };
@@ -349,22 +371,85 @@ export default function RoomDetailPage() {
         pc.createOffer()
           .then((offer) => pc.setLocalDescription(offer))
           .then(() => {
-            socket.emit("webrtc:signal", {
-              targetSocketId,
-              signalData: { type: "offer", sdp: pc.localDescription },
+            dispatchSignal(targetPeerId, {
+              type: "offer",
+              sdp: pc.localDescription,
             });
           })
           .catch((err) => console.error("WebRTC offer error:", err));
       }
 
-      peerConnections.current.set(targetSocketId, pc);
+      peerConnections.current.set(targetPeerId, pc);
       return pc;
+    };
+
+    const handleSignal = async ({ senderId, signalData }: { senderId: string; signalData: any }) => {
+      if (!senderId || !signalData) return;
+      let pc = peerConnections.current.get(senderId);
+      if (!pc) {
+        pc = createPeer(senderId, false);
+      }
+
+      try {
+        if (signalData.type === "offer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
+          const queued = pendingIceCandidates.current.get(senderId) || [];
+          for (const cand of queued) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(cand));
+            } catch {}
+          }
+          pendingIceCandidates.current.delete(senderId);
+
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          dispatchSignal(senderId, {
+            type: "answer",
+            sdp: pc.localDescription,
+          });
+        } else if (signalData.type === "answer") {
+          if (pc.signalingState === "have-local-offer") {
+            await pc.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
+            const queued = pendingIceCandidates.current.get(senderId) || [];
+            for (const cand of queued) {
+              try {
+                await pc.addIceCandidate(new RTCIceCandidate(cand));
+              } catch {}
+            }
+            pendingIceCandidates.current.delete(senderId);
+          }
+        } else if (signalData.type === "candidate") {
+          if (pc.remoteDescription && pc.remoteDescription.type) {
+            await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
+          } else {
+            const list = pendingIceCandidates.current.get(senderId) || [];
+            list.push(signalData.candidate);
+            pendingIceCandidates.current.set(senderId, list);
+          }
+        } else if (signalData.type === "status") {
+          setPeers((prev) => {
+            const map = new Map(prev);
+            const existing = map.get(senderId);
+            if (existing) {
+              map.set(senderId, {
+                ...existing,
+                isMuted: signalData.status?.isMuted !== undefined ? signalData.status.isMuted : existing.isMuted,
+                isVideoOn: signalData.status?.isVideoOn !== undefined ? signalData.status.isVideoOn : existing.isVideoOn,
+                isScreenSharing: signalData.status?.isScreenSharing !== undefined ? signalData.status.isScreenSharing : existing.isScreenSharing,
+              });
+            }
+            return map;
+          });
+        }
+      } catch (err) {
+        console.warn("Signal handling warning:", err);
+      }
     };
 
     const handleAllPeers = (allPeers: PeerInfo[]) => {
       const map = new Map();
       allPeers.forEach((p) => {
-        if (p.socketId === socket.id || p.user?.id === effectiveUser?.id || p.user?.username === effectiveUser?.username) return;
+        if (p.socketId === socket.id || p.user?.id === currentUser?.id || p.user?.username === currentUser?.username) return;
         map.set(p.socketId, p);
         createPeer(p.socketId, true);
       });
@@ -372,7 +457,7 @@ export default function RoomDetailPage() {
     };
 
     const handlePeerJoined = (newPeer: PeerInfo) => {
-      if (newPeer.socketId === socket.id || newPeer.user?.id === effectiveUser?.id || newPeer.user?.username === effectiveUser?.username) return;
+      if (newPeer.socketId === socket.id || newPeer.user?.id === currentUser?.id || newPeer.user?.username === currentUser?.username) return;
       setPeers((prev) => {
         const map = new Map(prev);
         map.set(newPeer.socketId, newPeer);
@@ -381,27 +466,12 @@ export default function RoomDetailPage() {
       createPeer(newPeer.socketId, false);
     };
 
-    const handleSignal = async ({ senderSocketId, signalData }: any) => {
-      let pc = peerConnections.current.get(senderSocketId);
-      if (!pc) pc = createPeer(senderSocketId, false);
-
-      if (signalData.type === "offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("webrtc:signal", {
-          targetSocketId: senderSocketId,
-          signalData: { type: "answer", sdp: pc.localDescription },
-        });
-      } else if (signalData.type === "answer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
-      } else if (signalData.type === "candidate") {
-        await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
-      }
+    const handleSocketSignal = ({ senderSocketId, signalData }: any) => {
+      handleSignal({ senderId: senderSocketId, signalData });
     };
 
     const handleParticipantUpdated = (info: PeerInfo) => {
-      if (info.socketId === socket.id || info.user?.id === effectiveUser?.id || info.user?.username === effectiveUser?.username) return;
+      if (info.socketId === socket.id || info.user?.id === currentUser?.id || info.user?.username === currentUser?.username) return;
       setPeers((prev) => {
         const map = new Map(prev);
         map.set(info.socketId, info);
@@ -465,17 +535,108 @@ export default function RoomDetailPage() {
 
     socket.on("webrtc:all-peers", handleAllPeers);
     socket.on("webrtc:peer-joined", handlePeerJoined);
-    socket.on("webrtc:signal", handleSignal);
+    socket.on("webrtc:signal", handleSocketSignal);
     socket.on("webrtc:participant-updated", handleParticipantUpdated);
     socket.on("webrtc:peer-left", handlePeerLeft);
     socket.on("room:message:received", handleNewMessage);
     socket.on("media:suggest:queue:updated", handleQueueUpdated);
     socket.on("media:sync:state", handleMediaSyncState);
 
+    // 1. Join room in database immediately upon entering
+    fetch(`/api/rooms/${roomCode}/join`, { method: "POST" })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.participants) {
+          setRoom((prev) => (prev ? { ...prev, participants: data.participants } : null));
+        }
+      })
+      .catch(() => {});
+
+    // 2. Serverless sync interval: poll HTTP signals & refresh DB participants
+    const syncInterval = setInterval(async () => {
+      if (!currentUser?.id) return;
+
+      // A. If sockets are disconnected, poll serverless signals
+      if (!socketRef.current?.connected) {
+        try {
+          const sigRes = await fetch(
+            `/api/rooms/${roomCode}/signal?userId=${encodeURIComponent(currentUser.id)}`
+          );
+          if (sigRes.ok) {
+            const sigData = await sigRes.json();
+            if (sigData.signals && sigData.signals.length > 0) {
+              for (const envelope of sigData.signals) {
+                await handleSignal({
+                  senderId: envelope.fromUserId,
+                  signalData: envelope.signalData,
+                });
+              }
+            }
+          }
+        } catch {}
+
+        // Poll chat messages fallback
+        try {
+          const chatRes = await fetch(`/api/rooms/${roomCode}/messages`);
+          if (chatRes.ok) {
+            const cData = await chatRes.json();
+            if (cData.messages) {
+              setChatMessages((prev) => {
+                if (cData.messages.length > prev.length) {
+                  return cData.messages;
+                }
+                return prev;
+              });
+            }
+          }
+        } catch {}
+      }
+
+      // B. Refresh participants from database and establish WebRTC mesh
+      try {
+        const roomRes = await fetch(`/api/rooms/${roomCode}`);
+        if (roomRes.ok) {
+          const rData = await roomRes.json();
+          if (rData.room && rData.room.participants) {
+            setRoom((prev) => (prev ? { ...prev, participants: rData.room.participants } : null));
+
+            rData.room.participants.forEach((p: any) => {
+              const pId = p.user?.id;
+              if (!pId || pId === currentUser.id || p.user?.username === currentUser.username) return;
+
+              // Ensure in peers map
+              setPeers((prev) => {
+                const next = new Map(prev);
+                if (!next.has(pId)) {
+                  next.set(pId, {
+                    socketId: pId,
+                    user: p.user,
+                    isMuted: !p.isVoiceActive,
+                    isVideoOn: Boolean(p.isVideoActive),
+                    isScreenSharing: Boolean(p.isScreenSharing),
+                  });
+                }
+                return next;
+              });
+
+              // If no peer connection exists yet, create one (lower ID initiates)
+              if (!peerConnections.current.has(pId)) {
+                const shouldInitiate = currentUser.id < pId;
+                createPeer(pId, shouldInitiate);
+              }
+            });
+          }
+        }
+      } catch {}
+    }, 2000);
+
     return () => {
+      clearInterval(syncInterval);
+      fetch(`/api/rooms/${roomCode}/leave`, { method: "POST" }).catch(() => {});
+
       socket.off("webrtc:all-peers", handleAllPeers);
       socket.off("webrtc:peer-joined", handlePeerJoined);
-      socket.off("webrtc:signal", handleSignal);
+      socket.off("webrtc:signal", handleSocketSignal);
       socket.off("webrtc:participant-updated", handleParticipantUpdated);
       socket.off("webrtc:peer-left", handlePeerLeft);
       socket.off("room:message:received", handleNewMessage);
@@ -498,6 +659,29 @@ export default function RoomDetailPage() {
     chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages, activePopup]);
 
+  // Helper: Dispatch status change (mute, camera, screenshare) to peers
+  const dispatchStatusChange = (status: { isMuted?: boolean; isVideoOn?: boolean; isScreenSharing?: boolean }) => {
+    socketRef.current?.emit("webrtc:status-change", {
+      roomCode: room?.code,
+      mediaStatus: status,
+    });
+
+    if (!socketRef.current?.connected && effectiveUser) {
+      peerConnections.current.forEach((_, targetId) => {
+        fetch(`/api/rooms/${roomCode}/signal`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            toUserId: targetId,
+            signalData: { type: "status", status },
+            fromUserId: effectiveUser.id,
+            fromUsername: effectiveUser.username,
+          }),
+        }).catch(() => {});
+      });
+    }
+  };
+
   // Controls: Mute
   const toggleMute = () => {
     if (localStreamRef.current) {
@@ -506,14 +690,13 @@ export default function RoomDetailPage() {
         audio.enabled = !audio.enabled;
         const next = !audio.enabled;
         setIsMuted(next);
-        socketRef.current?.emit("webrtc:status-change", {
-          roomCode: room?.code,
-          mediaStatus: { isMuted: next },
-        });
+        dispatchStatusChange({ isMuted: next });
         return;
       }
     }
-    setIsMuted(!isMuted);
+    const next = !isMuted;
+    setIsMuted(next);
+    dispatchStatusChange({ isMuted: next });
   };
 
   // Controls: Camera Video Toggle (Robust track replacement)
@@ -521,24 +704,25 @@ export default function RoomDetailPage() {
     if (isVideoOn) {
       if (localStreamRef.current) {
         localStreamRef.current.getVideoTracks().forEach((track) => {
-          track.stop();
-          localStreamRef.current?.removeTrack(track);
+          if (!track.label?.toLowerCase().includes("screen")) {
+            track.stop();
+            localStreamRef.current?.removeTrack(track);
+          }
         });
         setLocalStream(new MediaStream(localStreamRef.current.getTracks()));
       }
 
-      peerConnections.current.forEach((pc) => {
-        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-        if (sender) {
-          sender.replaceTrack(null);
-        }
-      });
+      if (!isScreenSharing) {
+        peerConnections.current.forEach((pc) => {
+          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+          if (sender) {
+            sender.replaceTrack(null);
+          }
+        });
+      }
 
       setIsVideoOn(false);
-      socketRef.current?.emit("webrtc:status-change", {
-        roomCode: room?.code,
-        mediaStatus: { isVideoOn: false },
-      });
+      dispatchStatusChange({ isVideoOn: false });
     } else {
       try {
         const videoStream = await navigator.mediaDevices.getUserMedia({
@@ -549,8 +733,10 @@ export default function RoomDetailPage() {
 
         if (localStreamRef.current) {
           localStreamRef.current.getVideoTracks().forEach((t) => {
-            t.stop();
-            localStreamRef.current?.removeTrack(t);
+            if (!t.label?.toLowerCase().includes("screen")) {
+              t.stop();
+              localStreamRef.current?.removeTrack(t);
+            }
           });
           localStreamRef.current.addTrack(videoTrack);
         } else {
@@ -560,21 +746,20 @@ export default function RoomDetailPage() {
         // Update localStream state to re-render local ParticipantTile
         setLocalStream(new MediaStream(localStreamRef.current.getTracks()));
 
-        // Update remote peer connections
-        peerConnections.current.forEach((pc) => {
-          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-          if (sender) {
-            sender.replaceTrack(videoTrack);
-          } else {
-            pc.addTrack(videoTrack, localStreamRef.current!);
-          }
-        });
+        // Update remote peer connections if not actively screen sharing
+        if (!isScreenSharing) {
+          peerConnections.current.forEach((pc) => {
+            const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+            if (sender) {
+              sender.replaceTrack(videoTrack);
+            } else {
+              pc.addTrack(videoTrack, localStreamRef.current!);
+            }
+          });
+        }
 
         setIsVideoOn(true);
-        socketRef.current?.emit("webrtc:status-change", {
-          roomCode: room?.code,
-          mediaStatus: { isVideoOn: true },
-        });
+        dispatchStatusChange({ isVideoOn: true });
       } catch (err) {
         console.error("Camera error inside room:", err);
         alert("Camera access denied or camera busy. Check browser permissions.");
@@ -592,10 +777,18 @@ export default function RoomDetailPage() {
         localStreamRef.current?.removeTrack(track);
       }
       setIsScreenSharing(false);
-      socketRef.current?.emit("webrtc:status-change", {
-        roomCode: room?.code,
-        mediaStatus: { isScreenSharing: false },
+
+      // Revert to camera video if camera was enabled
+      const camTrack = isVideoOn ? localStreamRef.current?.getVideoTracks()[0] || null : null;
+      peerConnections.current.forEach((pc) => {
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+        if (sender) {
+          sender.replaceTrack(camTrack);
+        }
       });
+
+      setLocalStream(localStreamRef.current ? new MediaStream(localStreamRef.current.getTracks()) : null);
+      dispatchStatusChange({ isScreenSharing: false, isVideoOn });
     } else {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
@@ -603,10 +796,15 @@ export default function RoomDetailPage() {
 
         screenTrack.onended = () => {
           setIsScreenSharing(false);
-          socketRef.current?.emit("webrtc:status-change", {
-            roomCode: room?.code,
-            mediaStatus: { isScreenSharing: false },
+          const camTrack = isVideoOn ? localStreamRef.current?.getVideoTracks()[0] || null : null;
+          peerConnections.current.forEach((pc) => {
+            const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+            if (sender) {
+              sender.replaceTrack(camTrack);
+            }
           });
+          setLocalStream(localStreamRef.current ? new MediaStream(localStreamRef.current.getTracks()) : null);
+          dispatchStatusChange({ isScreenSharing: false, isVideoOn });
         };
 
         if (localStreamRef.current) {
@@ -627,10 +825,7 @@ export default function RoomDetailPage() {
         });
 
         setIsScreenSharing(true);
-        socketRef.current?.emit("webrtc:status-change", {
-          roomCode: room?.code,
-          mediaStatus: { isScreenSharing: true },
-        });
+        dispatchStatusChange({ isScreenSharing: true });
       } catch (err) {
         console.error("Screen share error:", err);
       }
@@ -973,15 +1168,19 @@ export default function RoomDetailPage() {
       isVideoOn: isVideoOn,
       isScreenSharing: isScreenSharing,
     },
-    ...otherParticipants.map((p) => ({
-      id: p.socketId,
-      username: p.user.username,
-      stream: remoteStreams.get(p.socketId) || null,
-      isLocal: false,
-      isMuted: p.isMuted,
-      isVideoOn: p.isVideoOn,
-      isScreenSharing: p.isScreenSharing,
-    })),
+    ...otherParticipants.map((p) => {
+      const pId = p.user?.id || p.socketId;
+      const stream = remoteStreams.get(pId) || remoteStreams.get(p.socketId) || null;
+      return {
+        id: pId,
+        username: p.user.username,
+        stream,
+        isLocal: false,
+        isMuted: p.isMuted,
+        isVideoOn: p.isVideoOn,
+        isScreenSharing: p.isScreenSharing,
+      };
+    }),
   ];
 
   const pinnedParticipant = allParticipants.find((p) => p.id === pinnedId) || null;

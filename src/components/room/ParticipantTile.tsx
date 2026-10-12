@@ -37,32 +37,50 @@ export default function ParticipantTile({
   className = "",
 }: ParticipantTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [objectFitContain, setObjectFitContain] = useState(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const animFrameRef = useRef<number | null>(null);
 
-  // 1. Bind media stream to HTMLVideoElement reliably (audio always plays)
+  // 1. Bind media stream to HTMLVideoElement and dedicated HTMLAudioElement reliably
   useEffect(() => {
     const videoEl = videoRef.current;
-    if (!videoEl) return;
+    const audioEl = audioRef.current;
 
     if (stream) {
-      if (videoEl.srcObject !== stream) {
+      if (videoEl && videoEl.srcObject !== stream) {
         videoEl.srcObject = stream;
+        videoEl.play().catch(() => {});
       }
-      videoEl
-        .play()
-        .catch(() => {
-          // Autoplay fallback: if blocked, mute momentarily on remote so stream starts
-          if (!isLocal) {
-            videoEl.muted = false;
-          }
-        });
+      if (!isLocal && audioEl && audioEl.srcObject !== stream) {
+        audioEl.srcObject = stream;
+        audioEl.play().catch(() => {});
+      }
     } else {
-      videoEl.srcObject = null;
+      if (videoEl) videoEl.srcObject = null;
+      if (audioEl) audioEl.srcObject = null;
     }
+
+    // Autoplay unlock upon any user interaction
+    const unlockAutoplay = () => {
+      if (!isLocal && audioEl && audioEl.paused) {
+        audioEl.play().catch(() => {});
+      }
+      if (videoEl && videoEl.paused) {
+        videoEl.play().catch(() => {});
+      }
+    };
+
+    window.addEventListener("click", unlockAutoplay, { passive: true });
+    window.addEventListener("touchstart", unlockAutoplay, { passive: true });
+    window.addEventListener("keydown", unlockAutoplay, { passive: true });
+
+    return () => {
+      window.removeEventListener("click", unlockAutoplay);
+      window.removeEventListener("touchstart", unlockAutoplay);
+      window.removeEventListener("keydown", unlockAutoplay);
+    };
   }, [stream, isLocal]);
 
   // 2. Throttled Active Speaker Detection via Web Audio API (Low CPU)
@@ -129,7 +147,12 @@ export default function ParticipantTile({
     stream &&
       stream.getVideoTracks().some((track) => track.readyState === "live" && track.enabled)
   );
-  const showVideo = Boolean((isVideoOn || isScreenSharing) && (stream || hasLiveVideoTrack));
+  const showVideo = isLocal
+    ? Boolean((isVideoOn || isScreenSharing) && hasLiveVideoTrack)
+    : Boolean(hasLiveVideoTrack || isVideoOn || isScreenSharing);
+  const isScreen = isScreenSharing || Boolean(
+    stream && stream.getVideoTracks().some((t) => t.label?.toLowerCase().includes("screen"))
+  );
 
   return (
     <div
@@ -139,6 +162,16 @@ export default function ParticipantTile({
           : "border-white/5 hover:border-white/15 shadow-clay-card"
       } ${className}`}
     >
+      {/* Remote Audio Track Direct Player (Ensures voice sounds even if video is hidden) */}
+      {!isLocal && (
+        <audio
+          ref={audioRef}
+          autoPlay
+          playsInline
+          className="hidden"
+        />
+      )}
+
       {/* Video Element */}
       <video
         ref={videoRef}
@@ -148,7 +181,7 @@ export default function ParticipantTile({
         className={`w-full h-full transition-opacity duration-300 ${
           objectFitContain ? "object-contain" : "object-cover"
         } ${showVideo ? "opacity-100" : "opacity-0 pointer-events-none absolute"} ${
-          isLocal && !isScreenSharing ? "scale-x-[-1]" : ""
+          isLocal && !isScreen ? "scale-x-[-1]" : ""
         }`}
       />
 
@@ -239,14 +272,14 @@ export default function ParticipantTile({
             </span>
           ) : null}
 
-          {isScreenSharing && (
+          {isScreen && (
             <span className="clay-pill px-1.5 py-0.5 text-[10px] text-cyan-300 font-medium bg-cyan-950/80 backdrop-blur-md border border-cyan-900/40 flex items-center gap-1">
               <MonitorUp className="w-2.5 h-2.5" />
               <span className="hidden sm:inline">Screen</span>
             </span>
           )}
 
-          {showVideo && !isScreenSharing && (
+          {showVideo && !isScreen && (
             <span className="clay-pill p-1 text-brand-400 bg-black/80 backdrop-blur-md border border-white/10">
               <Video className="w-3 h-3" />
             </span>

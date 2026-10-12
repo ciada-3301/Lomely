@@ -364,6 +364,64 @@ export default function SyncPlayer({
     return () => clearInterval(interval);
   }, []);
 
+  // 4b. HTTP Media Sync Polling (Guarantees sync on serverless Vercel even if WebSocket is disconnected)
+  useEffect(() => {
+    let isCancelled = false;
+
+    const pollMediaState = async () => {
+      try {
+        const res = await fetch(`/api/rooms/${roomCode}/media`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (isCancelled || !data?.media) return;
+
+        const media = data.media;
+
+        // If media URL changed, update local player
+        if (media.url && media.url !== currentUrl) {
+          setCurrentUrl(media.url);
+          setMediaTitle(media.title || "Streaming Content");
+          setMediaType(media.url.includes("audius") ? "AUDIUS" : "YOUTUBE");
+        }
+
+        masterStateRef.current = {
+          state: media.state || "PLAYING",
+          currentTime: Number(media.currentTime) || 0,
+          updatedAt: Number(media.updatedAt) || Date.now(),
+        };
+
+        // In private rooms, non-hosts must strictly follow host state
+        if (!isPublicRoom && !isHost) {
+          const liveTime =
+            media.state === "PLAYING"
+              ? Number(media.currentTime) + (Date.now() - Number(media.updatedAt)) / 1000
+              : Number(media.currentTime);
+
+          if (media.state === "PLAYING") {
+            if (!isPlaying) {
+              playMediaLocal();
+            }
+            if (Math.abs(currentTimeRef.current - liveTime) > 2.0) {
+              seekMediaTo(liveTime, true);
+            }
+          } else if (media.state === "PAUSED") {
+            if (isPlaying) {
+              pauseMediaLocal();
+            }
+            seekMediaTo(media.currentTime);
+          }
+        }
+      } catch {}
+    };
+
+    pollMediaState();
+    const interval = setInterval(pollMediaState, 2000);
+    return () => {
+      isCancelled = true;
+      clearInterval(interval);
+    };
+  }, [roomCode, isPublicRoom, isHost, currentUrl, isPlaying]);
+
   // 5. Socket Synchronization Listeners
   useEffect(() => {
     if (!socket) return;
@@ -517,8 +575,15 @@ export default function SyncPlayer({
 
   // Play/Pause Action
   const handleTogglePlayPause = () => {
+    if (!isPublicRoom && !isHost) {
+      // In Private Room: Non-hosts cannot independently play or pause.
+      // Trigger the request modal to notify host
+      setRequestModalOpen(true);
+      return;
+    }
+
     if (isPublicRoom && !isHost) {
-      // In Public Room for non-host: Play/Pause ONLY controls local client
+      // In Public Room for non-host: Play/Pause ONLY controls local client (like YouTube Live)
       if (isPlaying) {
         pauseMediaLocal();
       } else {
@@ -527,13 +592,23 @@ export default function SyncPlayer({
       return;
     }
 
-    // In Private Room (or Host in Public Room): Global Sync
+    // Host controls: Global Sync for all roommates
     if (isPlaying) {
       pauseMediaLocal();
       socket?.emit("media:sync:pause", { roomCode, currentTime });
+      fetch(`/api/rooms/${roomCode}/media`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mediaState: "PAUSED", mediaTime: currentTime }),
+      }).catch(() => {});
     } else {
       playMediaLocal();
       socket?.emit("media:sync:play", { roomCode, currentTime });
+      fetch(`/api/rooms/${roomCode}/media`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mediaState: "PLAYING", mediaTime: currentTime }),
+      }).catch(() => {});
     }
   };
 
@@ -552,6 +627,11 @@ export default function SyncPlayer({
 
   // Seek Slider
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!isPublicRoom && !isHost) {
+      // Roommates in private rooms cannot scrub the timeline
+      return;
+    }
+
     const targetTime = Number(e.target.value);
     setCurrentTime(targetTime);
 
@@ -560,6 +640,13 @@ export default function SyncPlayer({
     } else {
       seekMediaTo(targetTime, true);
       socket?.emit("media:sync:seek", { roomCode, seekTime: targetTime });
+      if (isHost) {
+        fetch(`/api/rooms/${roomCode}/media`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mediaTime: targetTime }),
+        }).catch(() => {});
+      }
     }
   };
 
@@ -775,8 +862,11 @@ export default function SyncPlayer({
                 min={0}
                 max={duration || 100}
                 value={currentTime}
+                disabled={!isPublicRoom && !isHost}
                 onChange={handleSeek}
-                className="w-full h-1 bg-zinc-800 accent-brand-500 rounded-lg cursor-pointer"
+                className={`w-full h-1 bg-zinc-800 accent-brand-500 rounded-lg ${
+                  !isPublicRoom && !isHost ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
+                }`}
               />
             ) : null}
 
@@ -788,7 +878,13 @@ export default function SyncPlayer({
                   type="button"
                   onClick={handleTogglePlayPause}
                   className="p-1 text-brand-400 hover:text-white transition-colors"
-                  title={isPlaying ? "Pause" : "Play"}
+                  title={
+                    !isPublicRoom && !isHost
+                      ? "Playback controlled by host. Click to ask host to pause/play."
+                      : isPlaying
+                      ? "Pause"
+                      : "Play"
+                  }
                 >
                   {isPlaying ? (
                     <Pause className="w-4 h-4 fill-current" />
