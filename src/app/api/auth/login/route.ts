@@ -82,10 +82,20 @@ export async function POST(req: Request) {
     });
 
     return response;
-  } catch (error) {
+  } catch (error: any) {
     console.error("Login error:", error);
+    let errorMessage = "Internal server error during login";
+    if (error?.message) {
+      if (error.message.includes("does not exist") || error.message.includes("relation")) {
+        errorMessage = "Database tables are not migrated yet. Please verify Vercel database setup.";
+      } else if (error.message.includes("connect") || error.message.includes("P1001")) {
+        errorMessage = "Cannot connect to database. Please check DATABASE_URL in Vercel settings.";
+      } else if (error.message.includes("EROFS") || error.message.includes("read-only")) {
+        errorMessage = "SQLite cannot run on Vercel serverless. Please add a PostgreSQL database in Vercel Storage settings.";
+      }
+    }
     return NextResponse.json(
-      { error: "Internal server error during login" },
+      { error: errorMessage },
       { status: 500 }
     );
   }
