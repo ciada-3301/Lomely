@@ -221,15 +221,22 @@ export default function SignupPage() {
               </div>
 
               {debugOtp && (
-                <div className="clay-card p-3 text-xs text-brand-300 flex items-center justify-between">
-                  <span>Code: <strong>{debugOtp}</strong></span>
-                  <button
-                    type="button"
-                    onClick={() => setOtpCode(debugOtp)}
-                    className="clay-pill px-2 py-0.5 text-[10px] text-zinc-200"
-                  >
-                    Auto-fill
-                  </button>
+                <div className="clay-card p-3.5 text-xs text-brand-300 flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <span>
+                      Code: <strong className="font-mono text-white text-sm tracking-widest">{debugOtp}</strong>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setOtpCode(debugOtp)}
+                      className="clay-pill px-2.5 py-1 text-[11px] text-brand-300 hover:text-white"
+                    >
+                      Auto-fill
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-zinc-500">
+                    No email provider configured in Vercel. Verification code provided directly above for testing.
+                  </p>
                 </div>
               )}
 

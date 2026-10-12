@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { hashPassword } from "@/lib/auth";
-import { sendOtpEmail } from "@/lib/mail";
+import { sendOtpEmail, hasEmailProviderConfigured } from "@/lib/mail";
 
 export async function POST(req: Request) {
   try {
@@ -92,13 +92,17 @@ export async function POST(req: Request) {
     });
 
     await sendOtpEmail(cleanEmail, otpCode);
+    const hasEmailProvider = hasEmailProviderConfigured();
 
     return NextResponse.json({
       success: true,
-      message: "Account created. Verification OTP sent to email.",
+      message: hasEmailProvider
+        ? "Account created. Verification OTP sent to email."
+        : "Account created. Verification code generated.",
       email: cleanEmail,
-      // For instant local development DX, provide debugOtp if not in production
-      debugOtp: process.env.NODE_ENV !== "production" ? otpCode : undefined,
+      hasEmailProvider,
+      // Provide debugOtp if no email provider is configured on Vercel, or in local dev
+      debugOtp: !hasEmailProvider || process.env.NODE_ENV !== "production" ? otpCode : undefined,
     });
   } catch (error: any) {
     console.error("Registration error:", error);
