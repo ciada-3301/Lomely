@@ -45,39 +45,87 @@ export async function POST(req: Request) {
       );
     }
 
-    // Check existing
-    const existing = await prisma.user.findFirst({
-      where: {
-        OR: [{ username: cleanUsername }, { email: cleanEmail }],
-      },
+    // 1. Purge stale unverified registration attempts older than 24h
+    try {
+      await prisma.user.deleteMany({
+        where: {
+          isEmailVerified: false,
+          createdAt: { lt: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+        },
+      });
+    } catch (cleanupErr) {
+      // Non-fatal cleanup
+    }
+
+    // 2. Check existing records by email and username
+    const existingByEmail = await prisma.user.findUnique({
+      where: { email: cleanEmail },
     });
 
-    if (existing) {
-      if (existing.username === cleanUsername) {
+    const existingByUsername = await prisma.user.findUnique({
+      where: { username: cleanUsername },
+    });
+
+    const passwordHash = await hashPassword(password);
+    let user;
+
+    if (existingByEmail) {
+      // If the account is already verified, block re-registration and ask to login
+      if (existingByEmail.isEmailVerified) {
         return NextResponse.json(
-          { error: "This username is already taken" },
+          { error: "An account with this email already exists. Please sign in." },
           { status: 409 }
         );
       }
-      return NextResponse.json(
-        { error: "An account with this email already exists" },
-        { status: 409 }
-      );
+
+      // If an unverified user is restarting registration:
+      if (existingByUsername && existingByUsername.id !== existingByEmail.id) {
+        if (existingByUsername.isEmailVerified) {
+          return NextResponse.json(
+            { error: "This username is already taken by a registered user. Please choose another username." },
+            { status: 409 }
+          );
+        } else {
+          // Abandoned unverified user with this username; release the username
+          await prisma.user.delete({ where: { id: existingByUsername.id } });
+        }
+      }
+
+      // Update existing unverified record with latest username and password
+      user = await prisma.user.update({
+        where: { id: existingByEmail.id },
+        data: {
+          username: cleanUsername,
+          passwordHash,
+        },
+      });
+    } else {
+      // New email: check if username is claimed
+      if (existingByUsername) {
+        if (existingByUsername.isEmailVerified) {
+          return NextResponse.json(
+            { error: "This username is already taken. Please choose another username." },
+            { status: 409 }
+          );
+        } else {
+          // Abandoned unverified user with another email; release the username
+          await prisma.user.delete({ where: { id: existingByUsername.id } });
+        }
+      }
+
+      const verifiedUsersCount = await prisma.user.count({ where: { isEmailVerified: true } });
+      const role = verifiedUsersCount === 0 ? "ADMIN" : "USER";
+
+      user = await prisma.user.create({
+        data: {
+          username: cleanUsername,
+          email: cleanEmail,
+          passwordHash,
+          role,
+          isEmailVerified: false,
+        },
+      });
     }
-
-    const passwordHash = await hashPassword(password);
-    const userCount = await prisma.user.count();
-    const role = userCount === 0 ? "ADMIN" : "USER";
-
-    const user = await prisma.user.create({
-      data: {
-        username: cleanUsername,
-        email: cleanEmail,
-        passwordHash,
-        role,
-        isEmailVerified: false,
-      },
-    });
 
     // Generate 6-digit OTP
     const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
