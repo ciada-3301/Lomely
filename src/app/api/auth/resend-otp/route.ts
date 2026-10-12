@@ -33,7 +33,13 @@ export async function POST(req: Request) {
       },
     });
 
-    await sendOtpEmail(cleanEmail, otpCode);
+    const mailResult = await sendOtpEmail(cleanEmail, otpCode);
+    if (!mailResult.success && mailResult.error) {
+      return NextResponse.json(
+        { error: mailResult.error },
+        { status: 502 }
+      );
+    }
 
     return NextResponse.json({
       success: true,

@@ -10,11 +10,18 @@ export function hasEmailProviderConfigured(): boolean {
   );
 }
 
-export async function sendOtpEmail(email: string, code: string): Promise<boolean> {
+export interface MailResult {
+  success: boolean;
+  error?: string;
+}
+
+export async function sendOtpEmail(email: string, code: string): Promise<MailResult> {
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
   devOtpStore.set(email, { code, expiresAt });
 
-  // 1. Resend API support (lightweight REST call, zero extra packages required)
+  let lastError = "";
+
+  // 1. Resend API support (lightweight REST call)
   const resendApiKey = process.env.RESEND_API_KEY;
   if (resendApiKey) {
     try {
@@ -49,13 +56,21 @@ export async function sendOtpEmail(email: string, code: string): Promise<boolean
 
       if (res.ok) {
         console.log(`[MAILER] Sent OTP via Resend to ${email}`);
-        return true;
+        return { success: true };
       } else {
-        const errBody = await res.text();
-        console.error("[MAILER] Resend API error response:", errBody);
+        const errJson = await res.json().catch(() => null);
+        const errText = errJson?.message || (await res.text().catch(() => "Unknown Resend error"));
+        console.error("[MAILER] Resend API error response:", errText);
+
+        if (errText.includes("only send testing emails") || errText.includes("verify a domain")) {
+          lastError = "Resend Sandbox Restriction: onboarding@resend.dev can only send to your Resend account email. To send to other emails, use Gmail SMTP or verify a custom domain in Resend.";
+        } else {
+          lastError = `Resend error: ${errText}`;
+        }
       }
-    } catch (resendError) {
+    } catch (resendError: any) {
       console.error("[MAILER] Resend dispatch exception:", resendError);
+      lastError = resendError?.message || "Failed to dispatch email via Resend.";
     }
   }
 
@@ -77,7 +92,7 @@ export async function sendOtpEmail(email: string, code: string): Promise<boolean
       });
 
       await transporter.sendMail({
-        from: process.env.SMTP_FROM || `"Lomely" <no-reply@lomely.app>`,
+        from: process.env.SMTP_FROM || `"Lomely" <${smtpUser}>`,
         to: email,
         subject: `Your Lomely Verification Code: ${code}`,
         text: `Your verification code for Lomely is: ${code}\n\nThis code will expire in 10 minutes. If you did not request this, please ignore this email.`,
@@ -95,21 +110,27 @@ export async function sendOtpEmail(email: string, code: string): Promise<boolean
       });
 
       console.log(`[MAILER] Sent OTP via SMTP to ${email}`);
-      return true;
-    } catch (error) {
+      return { success: true };
+    } catch (error: any) {
       console.error("[MAILER] SMTP dispatch error:", error);
-      // Fallback to dev log
+      lastError = `SMTP error: ${error?.message || "Failed to dispatch email via SMTP."}`;
     }
   }
 
-  // 3. Fallback dev console output when no mail credentials are configured
-  console.log("\n=======================================================");
-  console.log(`[LOMELY DEV EMAIL DISPATCHER]`);
-  console.log(`Recipient: ${email}`);
-  console.log(`OTP Code : >>> ${code} <<<`);
-  console.log(`Expires  : ${expiresAt.toLocaleTimeString()}`);
-  console.log("Note: Set RESEND_API_KEY or SMTP_HOST/SMTP_USER/SMTP_PASS in Vercel to dispatch real emails.");
-  console.log("=======================================================\n");
+  // 3. Fallback dev console output when no mail credentials are configured at all
+  if (!resendApiKey && !smtpHost) {
+    console.log("\n=======================================================");
+    console.log(`[LOMELY DEV EMAIL DISPATCHER]`);
+    console.log(`Recipient: ${email}`);
+    console.log(`OTP Code : >>> ${code} <<<`);
+    console.log(`Expires  : ${expiresAt.toLocaleTimeString()}`);
+    console.log("Note: Set RESEND_API_KEY or SMTP_HOST/SMTP_USER/SMTP_PASS in Vercel to dispatch real emails.");
+    console.log("=======================================================\n");
+    return { success: true };
+  }
 
-  return true;
+  return {
+    success: false,
+    error: lastError || "Failed to send email. Please check your mail credentials in Vercel settings.",
+  };
 }
