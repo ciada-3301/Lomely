@@ -1,0 +1,118 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id              String            @id @default(cuid())
+  username        String            @unique
+  email           String            @unique
+  passwordHash    String
+  isEmailVerified Boolean           @default(false)
+  role            String            @default("USER") // USER | ADMIN
+  status          String            @default("ONLINE") // ONLINE | IDLE | DND | OFFLINE
+  avatarUrl       String?           @default("")
+  bio             String?           @default("")
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  hostedRooms     Room[]            @relation("HostedRooms")
+  participations  RoomParticipant[]
+  roomMessages    RoomMessage[]
+  sentDms         DirectMessage[]   @relation("SentDms")
+  receivedDms     DirectMessage[]   @relation("ReceivedDms")
+  invites         RoomInvite[]
+}
+
+model OtpVerification {
+  id        String   @id @default(cuid())
+  email     String
+  code      String
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([email])
+}
+
+model Room {
+  id               String            @id @default(cuid())
+  code             String            @unique // e.g. "lml-4x9z"
+  name             String
+  description      String?           @default("")
+  isPublic         Boolean           @default(true)
+  hostId           String
+  host             User              @relation("HostedRooms", fields: [hostId], references: [id], onDelete: Cascade)
+  
+  // Media Sync State
+  currentMediaUrl  String?           @default("")
+  currentMediaTitle String?          @default("")
+  mediaState       String            @default("IDLE") // PLAYING | PAUSED | IDLE
+  mediaTime        Float             @default(0)
+  mediaUpdatedAt   DateTime          @default(now())
+
+  participants     RoomParticipant[]
+  messages         RoomMessage[]
+  invites          RoomInvite[]
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@index([code])
+}
+
+model RoomParticipant {
+  id              String   @id @default(cuid())
+  roomId          String
+  userId          String
+  role            String   @default("MEMBER") // HOST | MODERATOR | MEMBER
+  isVoiceActive   Boolean  @default(false)
+  isVideoActive   Boolean  @default(false)
+  isScreenSharing Boolean  @default(false)
+  joinedAt        DateTime @default(now())
+
+  room            Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, userId])
+}
+
+model RoomInvite {
+  id            String   @id @default(cuid())
+  roomId        String
+  invitedUserId String
+  invitedBy     String
+  status        String   @default("PENDING") // PENDING | ACCEPTED | DECLINED
+  createdAt     DateTime @default(now())
+
+  room          Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user          User     @relation(fields: [invitedUserId], references: [id], onDelete: Cascade)
+}
+
+model RoomMessage {
+  id        String   @id @default(cuid())
+  roomId    String
+  senderId  String
+  content   String
+  createdAt DateTime @default(now())
+
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  sender    User     @relation(fields: [senderId], references: [id], onDelete: Cascade)
+}
+
+model DirectMessage {
+  id         String   @id @default(cuid())
+  senderId   String
+  receiverId String
+  content    String
+  isRead     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  sender     User     @relation("SentDms", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver   User     @relation("ReceivedDms", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@index([senderId, receiverId])
+}
