@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { sendOtpEmail, hasEmailProviderConfigured } from "@/lib/mail";
+import { sendOtpEmail } from "@/lib/mail";
 
 export async function POST(req: Request) {
   try {
@@ -34,15 +34,10 @@ export async function POST(req: Request) {
     });
 
     await sendOtpEmail(cleanEmail, otpCode);
-    const hasEmailProvider = hasEmailProviderConfigured();
 
     return NextResponse.json({
       success: true,
-      message: hasEmailProvider
-        ? "A fresh verification code has been dispatched."
-        : "A fresh verification code has been generated.",
-      hasEmailProvider,
-      debugOtp: !hasEmailProvider || process.env.NODE_ENV !== "production" ? otpCode : undefined,
+      message: "A fresh verification code has been dispatched to your email.",
     });
   } catch (error) {
     console.error("Resend OTP error:", error);

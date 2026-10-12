@@ -18,7 +18,6 @@ export default function SignupPage() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [debugOtp, setDebugOtp] = useState<string | null>(null);
   const [resendCooldown, setResendCooldown] = useState(0);
 
   const handleRegister = async (e: React.FormEvent) => {
@@ -36,10 +35,6 @@ export default function SignupPage() {
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || "Failed to create account");
-      }
-
-      if (data.debugOtp) {
-        setDebugOtp(data.debugOtp);
       }
 
       setStep("OTP");
@@ -102,7 +97,6 @@ export default function SignupPage() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Could not resend code");
-      if (data.debugOtp) setDebugOtp(data.debugOtp);
       startCooldown();
     } catch (err: any) {
       setError(err.message);
@@ -220,25 +214,7 @@ export default function SignupPage() {
                 </p>
               </div>
 
-              {debugOtp && (
-                <div className="clay-card p-3.5 text-xs text-brand-300 flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between">
-                    <span>
-                      Code: <strong className="font-mono text-white text-sm tracking-widest">{debugOtp}</strong>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setOtpCode(debugOtp)}
-                      className="clay-pill px-2.5 py-1 text-[11px] text-brand-300 hover:text-white"
-                    >
-                      Auto-fill
-                    </button>
-                  </div>
-                  <p className="text-[10px] text-zinc-500">
-                    No email provider configured in Vercel. Verification code provided directly above for testing.
-                  </p>
-                </div>
-              )}
+
 
               {error && (
                 <div className="p-3.5 rounded-xl bg-red-950/40 border border-red-900/50 flex items-start gap-2.5 text-xs text-red-300">

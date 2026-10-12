@@ -18,7 +18,6 @@ export default function LoginPage() {
   const [requiresOtp, setRequiresOtp] = useState(false);
   const [otpEmail, setOtpEmail] = useState("");
   const [otpCode, setOtpCode] = useState("");
-  const [debugOtp, setDebugOtp] = useState<string | null>(null);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -37,13 +36,11 @@ export default function LoginPage() {
         if (data.requiresVerification) {
           setRequiresOtp(true);
           setOtpEmail(data.email);
-          const otpRes = await fetch("/api/auth/resend-otp", {
+          await fetch("/api/auth/resend-otp", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ email: data.email }),
           });
-          const otpData = await otpRes.json();
-          if (otpData.debugOtp) setDebugOtp(otpData.debugOtp);
           return;
         }
         throw new Error(data.error || "Login failed");
@@ -173,18 +170,7 @@ export default function LoginPage() {
                 </p>
               </div>
 
-              {debugOtp && (
-                <div className="clay-card p-3 text-xs text-brand-300 flex items-center justify-between">
-                  <span>Code: <strong>{debugOtp}</strong></span>
-                  <button
-                    type="button"
-                    onClick={() => setOtpCode(debugOtp)}
-                    className="clay-pill px-2 py-0.5 text-[10px] text-zinc-200"
-                  >
-                    Auto-fill
-                  </button>
-                </div>
-              )}
+
 
               {error && (
                 <div className="p-3.5 rounded-xl bg-red-950/40 border border-red-900/50 flex items-start gap-2.5 text-xs text-red-300">
