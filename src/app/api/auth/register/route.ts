@@ -1,21 +1,19 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { hashPassword } from "@/lib/auth";
-import { sendOtpEmail } from "@/lib/mail";
+import { hashPassword, signToken, COOKIE_NAME } from "@/lib/auth";
 
 export async function POST(req: Request) {
   try {
-    const { username, email, password } = await req.json();
+    const { username, password, email } = await req.json();
 
-    if (!username || !email || !password) {
+    if (!username || !password) {
       return NextResponse.json(
-        { error: "Username, email, and password are required" },
+        { error: "Username and password are required" },
         { status: 400 }
       );
     }
 
     const cleanUsername = username.trim().toLowerCase();
-    const cleanEmail = email.trim().toLowerCase();
 
     if (cleanUsername.length < 3 || cleanUsername.length > 24) {
       return NextResponse.json(
@@ -31,13 +29,6 @@ export async function POST(req: Request) {
       );
     }
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-      return NextResponse.json(
-        { error: "Please provide a valid email address" },
-        { status: 400 }
-      );
-    }
-
     if (password.length < 6) {
       return NextResponse.json(
         { error: "Password must be at least 6 characters" },
@@ -45,113 +36,75 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1. Purge stale unverified registration attempts older than 24h
-    try {
-      await prisma.user.deleteMany({
-        where: {
-          isEmailVerified: false,
-          createdAt: { lt: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-        },
-      });
-    } catch (cleanupErr) {
-      // Non-fatal cleanup
-    }
+    const cleanEmail =
+      email && typeof email === "string" && email.trim()
+        ? email.trim().toLowerCase()
+        : `${cleanUsername}@lomely.app`;
 
-    // 2. Check existing records by email and username
-    const existingByEmail = await prisma.user.findUnique({
-      where: { email: cleanEmail },
-    });
-
-    const existingByUsername = await prisma.user.findUnique({
-      where: { username: cleanUsername },
-    });
-
-    const passwordHash = await hashPassword(password);
-    let user;
-
-    if (existingByEmail) {
-      // If the account is already verified, block re-registration and ask to login
-      if (existingByEmail.isEmailVerified) {
-        return NextResponse.json(
-          { error: "An account with this email already exists. Please sign in." },
-          { status: 409 }
-        );
-      }
-
-      // If an unverified user is restarting registration:
-      if (existingByUsername && existingByUsername.id !== existingByEmail.id) {
-        if (existingByUsername.isEmailVerified) {
-          return NextResponse.json(
-            { error: "This username is already taken by a registered user. Please choose another username." },
-            { status: 409 }
-          );
-        } else {
-          // Abandoned unverified user with this username; release the username
-          await prisma.user.delete({ where: { id: existingByUsername.id } });
-        }
-      }
-
-      // Update existing unverified record with latest username and password
-      user = await prisma.user.update({
-        where: { id: existingByEmail.id },
-        data: {
-          username: cleanUsername,
-          passwordHash,
-        },
-      });
-    } else {
-      // New email: check if username is claimed
-      if (existingByUsername) {
-        if (existingByUsername.isEmailVerified) {
-          return NextResponse.json(
-            { error: "This username is already taken. Please choose another username." },
-            { status: 409 }
-          );
-        } else {
-          // Abandoned unverified user with another email; release the username
-          await prisma.user.delete({ where: { id: existingByUsername.id } });
-        }
-      }
-
-      const verifiedUsersCount = await prisma.user.count({ where: { isEmailVerified: true } });
-      const role = verifiedUsersCount === 0 ? "ADMIN" : "USER";
-
-      user = await prisma.user.create({
-        data: {
-          username: cleanUsername,
-          email: cleanEmail,
-          passwordHash,
-          role,
-          isEmailVerified: false,
-        },
-      });
-    }
-
-    // Generate 6-digit OTP
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-
-    await prisma.otpVerification.create({
-      data: {
-        email: cleanEmail,
-        code: otpCode,
-        expiresAt,
+    // Check if username already exists
+    const existing = await prisma.user.findFirst({
+      where: {
+        OR: [{ username: cleanUsername }, { email: cleanEmail }],
       },
     });
 
-    const mailResult = await sendOtpEmail(cleanEmail, otpCode);
-    if (!mailResult.success && mailResult.error) {
+    if (existing) {
+      if (existing.username === cleanUsername) {
+        return NextResponse.json(
+          { error: "This username is already taken. Please pick another one." },
+          { status: 409 }
+        );
+      }
       return NextResponse.json(
-        { error: mailResult.error },
-        { status: 502 }
+        { error: "An account with this email already exists. Please sign in." },
+        { status: 409 }
       );
     }
 
-    return NextResponse.json({
-      success: true,
-      message: "Account created. Verification OTP sent to your email.",
-      email: cleanEmail,
+    const passwordHash = await hashPassword(password);
+    const userCount = await prisma.user.count();
+    const role = userCount === 0 ? "ADMIN" : "USER";
+
+    const user = await prisma.user.create({
+      data: {
+        username: cleanUsername,
+        email: cleanEmail,
+        passwordHash,
+        role,
+        isEmailVerified: true,
+      },
     });
+
+    const token = signToken({
+      userId: user.id,
+      email: user.email,
+      username: user.username,
+      role: user.role,
+    });
+
+    const response = NextResponse.json({
+      success: true,
+      message: "Account created successfully!",
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        status: user.status,
+      },
+    });
+
+    response.cookies.set({
+      name: COOKIE_NAME,
+      value: token,
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60, // 7 days
+      path: "/",
+    });
+
+    return response;
   } catch (error: any) {
     console.error("Registration error:", error);
     let errorMessage = "Internal server error during registration";

@@ -37,14 +37,10 @@ export async function POST(req: Request) {
     }
 
     if (!user.isEmailVerified) {
-      return NextResponse.json(
-        {
-          error: "Your email address is not verified yet. Please verify your OTP.",
-          requiresVerification: true,
-          email: user.email,
-        },
-        { status: 403 }
-      );
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { isEmailVerified: true },
+      }).catch(() => {});
     }
 
     const token = signToken({
